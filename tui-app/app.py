@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
+from textual.suggester import Suggester
 from textual.widgets import (
     ContentSwitcher,
     DirectoryTree,
@@ -55,6 +57,8 @@ COMMANDS = {
     "left": "Reset the left panel to its placeholder",
     "term": "Show an interactive terminal in the bottom panel (F2 to leave it)",
     "bottom": "Reset the bottom panel to its placeholder",
+    "delete": "Delete a file (Tab to autocomplete the path)",
+    "delete_folder": "Delete an empty folder, or add -f/--force to delete it and everything inside",
     "help": "List available commands",
 }
 
@@ -107,6 +111,62 @@ class FileTree(DirectoryTree):
             if dirty == path or path in dirty.parents:
                 return True
         return False
+
+
+class DeletePathSuggester(Suggester):
+    """Tab-completes the path argument of /delete and /delete_folder."""
+
+    def __init__(self, app: LayoutApp) -> None:
+        super().__init__(use_cache=False, case_sensitive=True)
+        self._layout_app = app
+
+    async def get_suggestion(self, value: str) -> str | None:
+        if value.startswith("/delete_folder "):
+            command, want_dir = "/delete_folder ", True
+        elif value.startswith("/delete "):
+            command, want_dir = "/delete ", False
+        else:
+            return None
+
+        partial = value[len(command) :]
+        if not partial or " " in partial:
+            # Nothing typed yet, or the path is finished and a flag (e.g.
+            # -f) is being typed - nothing sensible left to complete.
+            return None
+
+        dir_part, _, name_prefix = partial.rpartition("/")
+        if dir_part.startswith("~"):
+            base = Path(dir_part).expanduser()
+        elif dir_part.startswith("/"):
+            base = Path(dir_part)
+        else:
+            base = self._layout_app.root_path / dir_part
+
+        try:
+            entries = sorted(base.iterdir())
+        except OSError:
+            return None
+
+        for entry in entries:
+            if entry.is_dir() != want_dir:
+                continue
+            if entry.name.startswith(name_prefix):
+                completed = f"{dir_part}/{entry.name}" if dir_part else entry.name
+                if want_dir:
+                    completed += "/"
+                return f"{command}{completed}"
+        return None
+
+
+class CommandInput(Input):
+    """Input that accepts a suggestion with Tab instead of the default Right/End."""
+
+    BINDINGS = [Binding("tab", "accept_suggestion", "Complete", show=False)]
+
+    def action_accept_suggestion(self) -> None:
+        if self._suggestion:
+            self.value = self._suggestion
+            self.cursor_position = len(self.value)
 
 
 class LayoutApp(App):
@@ -172,7 +232,11 @@ class LayoutApp(App):
         with ContentSwitcher(initial="bottom-placeholder", id="bottom"):
             yield Static("Bottom Panel", id="bottom-placeholder")
             yield PtyTerminal(id="bottom-term")
-        yield Input(id="command-bar", select_on_focus=False)
+        yield CommandInput(
+            id="command-bar",
+            select_on_focus=False,
+            suggester=DeletePathSuggester(self),
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -364,6 +428,109 @@ class LayoutApp(App):
             self.open_file_path = target
             workspace.focus()
 
+    def _resolve_within_root(self, path_str: str) -> Path | None:
+        """Resolve a /delete[_folder] path argument, kept scoped inside the
+        tree's root - typos or accidents shouldn't be able to reach outside
+        the directory being browsed."""
+        path_str = path_str.strip()
+        if not path_str:
+            return None
+        raw = Path(path_str).expanduser()
+        candidate = raw if raw.is_absolute() else self.root_path / raw
+        try:
+            resolved = candidate.resolve()
+            root_resolved = self.root_path.resolve()
+        except OSError:
+            return None
+        if resolved != root_resolved and root_resolved not in resolved.parents:
+            return None
+        return resolved
+
+    def _forget_path(self, path: Path, recursive: bool = False) -> None:
+        """Drop any buffered/dirty state for a path (or, if recursive,
+        anything under it) that no longer exists after a delete."""
+
+        def matches(candidate: Path) -> bool:
+            return candidate == path or (recursive and path in candidate.parents)
+
+        for stale in [p for p in self.buffers if matches(p)]:
+            self.buffers.pop(stale, None)
+        for stale in [p for p in self.dirty_paths if matches(p)]:
+            self.dirty_paths.discard(stale)
+        for stale in [p for p in self._saved_reference if matches(p)]:
+            self._saved_reference.pop(stale, None)
+
+        if self.open_file_path is not None and matches(self.open_file_path):
+            self.open_file_path = None
+            workspace = self.query_one("#workspace", TextArea)
+            workspace.read_only = True
+            workspace.language = None
+            workspace.load_text(f"{path} was deleted.")
+
+    def _cmd_delete(self, arg: str) -> None:
+        path = self._resolve_within_root(arg)
+        if path is None:
+            self.notify("Usage: /delete <file>", severity="error")
+            return
+        if not path.exists():
+            self.notify(f"No such file: {path}", severity="error")
+            return
+        if path.is_dir():
+            self.notify(f"{path} is a folder - use /delete_folder", severity="error")
+            return
+        try:
+            path.unlink()
+        except OSError as e:
+            self.notify(f"Could not delete {path}:\n{e}", severity="error")
+            return
+        self._forget_path(path)
+        self.query_one("#left-tree", FileTree).reload()
+        self.notify(f"Deleted {path}", timeout=2)
+
+    def _cmd_delete_folder(self, arg: str) -> None:
+        tokens = arg.split()
+        force = False
+        path_tokens = []
+        for token in tokens:
+            if token in ("-f", "--force"):
+                force = True
+            else:
+                path_tokens.append(token)
+
+        path = self._resolve_within_root(" ".join(path_tokens))
+        if path is None:
+            self.notify("Usage: /delete_folder <folder> [-f|--force]", severity="error")
+            return
+        if not path.exists():
+            self.notify(f"No such folder: {path}", severity="error")
+            return
+        if not path.is_dir():
+            self.notify(f"{path} is a file - use /delete", severity="error")
+            return
+        if path == self.root_path.resolve():
+            self.notify("Cannot delete the tree's root folder", severity="error")
+            return
+
+        has_contents = any(path.iterdir())
+        if has_contents and not force:
+            self.notify(
+                f"{path} is not empty - add -f to delete it and everything inside",
+                severity="error",
+            )
+            return
+
+        try:
+            if has_contents:
+                shutil.rmtree(path)
+            else:
+                path.rmdir()
+        except OSError as e:
+            self.notify(f"Could not delete {path}:\n{e}", severity="error")
+            return
+        self._forget_path(path, recursive=True)
+        self.query_one("#left-tree", FileTree).reload()
+        self.notify(f"Deleted folder {path}", timeout=2)
+
     def run_command(self, raw: str) -> None:
         text = raw.strip()
         if text.startswith("/"):
@@ -395,6 +562,10 @@ class LayoutApp(App):
             self.notify("Terminal focused. Press F2 to leave it.", timeout=3)
         elif name == "bottom":
             bottom_switcher.current = "bottom-placeholder"
+        elif name == "delete":
+            self._cmd_delete(arg)
+        elif name == "delete_folder":
+            self._cmd_delete_folder(arg)
         elif name == "help":
             self.notify("\n".join(f"/{cmd} - {desc}" for cmd, desc in COMMANDS.items()))
         else:
