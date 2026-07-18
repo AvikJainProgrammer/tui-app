@@ -62,6 +62,28 @@ def _terminate_and_reap(pid: int, timeout: float = 0.2) -> None:
         pass
 
 
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_PYTE_COLOR_FIXUPS = {"brown": "yellow"}
+
+
+def _pyte_color(value: str | None) -> str | None:
+    """Convert a pyte Char.fg/bg value to a color Rich will accept.
+
+    pyte represents 256-color/truecolor as a bare 6-digit hex string
+    (Rich requires a leading "#"), and uses "brown"/"brightXXX" names that
+    don't exist in Rich's palette (Rich wants "yellow"/"bright_xxx"). Any
+    of these left unconverted raises inside Style(), which previously
+    crashed mid-paint and froze the whole panel with no further updates.
+    """
+    if value in (None, "default"):
+        return None
+    if len(value) == 6 and all(c in _HEX_DIGITS for c in value):
+        return f"#{value}"
+    if value.startswith("bright") and not value.startswith("bright_"):
+        value = "bright_" + value[len("bright") :]
+    return _PYTE_COLOR_FIXUPS.get(value, value)
+
+
 KEY_BYTES = {
     "enter": b"\r",
     "escape": b"\x1b",
@@ -110,16 +132,21 @@ class PtyTerminal(Widget, can_focus=True):
         self._stream: pyte.Stream | None = None
 
     def on_mount(self) -> None:
-        cols = max(self.size.width, 1) or 80
-        rows = max(self.size.height, 1) or 24
+        # This widget mounts hidden (it's the non-initial child of a
+        # ContentSwitcher), so self.size is genuinely (0, 0) here - fall
+        # back to a plausible default rather than a degenerate 1x1 pty,
+        # which is enough to send bash's readline into a bad state until
+        # the first real resize (see on_resize).
+        cols = self.size.width or 80
+        rows = self.size.height or 24
         self._start_shell(rows, cols)
 
     def on_unmount(self) -> None:
         self._stop_shell()
 
     def on_resize(self, event: events.Resize) -> None:
-        cols = max(event.size.width, 1)
-        rows = max(event.size.height, 1)
+        cols = event.size.width or 80
+        rows = event.size.height or 24
         if self._screen is None:
             self._start_shell(rows, cols)
             return
@@ -150,6 +177,16 @@ class PtyTerminal(Widget, can_focus=True):
             return
         try:
             fcntl.ioctl(self._fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        except OSError:
+            return
+        # The ioctl alone doesn't notify an already-running shell (or
+        # whatever it's currently running in the foreground, e.g. vim) that
+        # the size changed - without SIGWINCH, bash's readline in particular
+        # keeps assuming its old (possibly 1x1-at-startup) size and can
+        # misbehave badly, which looks just like a hang.
+        try:
+            pgrp = os.tcgetpgrp(self._fd)
+            os.killpg(pgrp, signal.SIGWINCH)
         except OSError:
             pass
 
@@ -204,7 +241,10 @@ class PtyTerminal(Widget, can_focus=True):
         if data is None and event.character:
             data = event.character.encode()
         if data:
-            os.write(self._fd, data)
+            try:
+                os.write(self._fd, data)
+            except OSError:
+                pass
 
     def render(self) -> Text:
         if self._screen is None:
@@ -228,14 +268,17 @@ class PtyTerminal(Widget, can_focus=True):
     def _char_style(char: pyte.screens.Char | None) -> Style:
         if char is None:
             return Style()
-        fg = None if char.fg in (None, "default") else char.fg
-        bg = None if char.bg in (None, "default") else char.bg
-        return Style(
-            color=fg,
-            bgcolor=bg,
-            bold=char.bold or None,
-            italic=char.italics or None,
-            underline=char.underscore or None,
-            reverse=char.reverse or None,
-            strike=char.strikethrough or None,
-        )
+        try:
+            return Style(
+                color=_pyte_color(char.fg),
+                bgcolor=_pyte_color(char.bg),
+                bold=char.bold or None,
+                italic=char.italics or None,
+                underline=char.underscore or None,
+                reverse=char.reverse or None,
+                strike=char.strikethrough or None,
+            )
+        except Exception:
+            # Never let an unrecognized pyte color value break rendering -
+            # that previously froze the whole panel (see _pyte_color).
+            return Style()
