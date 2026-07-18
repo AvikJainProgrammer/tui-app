@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 *.swp
 *.swo
+.tui_index.json

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rich.text import Text
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
@@ -16,11 +17,15 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Label,
+    ListItem,
+    ListView,
     Static,
     TextArea,
 )
 
 from pty_terminal import PtyTerminal
+from search_index import build_index, load_index, save_index, search_index
 
 # Files larger than this are shown read-only rather than loaded into the
 # editor, so a save can never silently truncate a file we didn't fully load.
@@ -59,6 +64,8 @@ COMMANDS = {
     "bottom": "Reset the bottom panel to its placeholder",
     "delete": "Delete a file (Tab to autocomplete the path)",
     "delete_folder": "Delete an empty folder, or add -f/--force to delete it and everything inside",
+    "index": "Index all files under the root so /search works (saved to disk, persists across restarts)",
+    "search": "Type a keyword after /search for live results in the bottom panel (Up/Down to pick, Enter to open)",
     "help": "List available commands",
 }
 
@@ -163,14 +170,57 @@ class DeletePathSuggester(Suggester):
 
 
 class CommandInput(Input):
-    """Input that accepts a suggestion with Tab instead of the default Right/End."""
+    """Input that accepts a suggestion with Tab instead of the default
+    Right/End, and forwards Up/Down to the live /search results list
+    (Input itself doesn't use those keys for anything)."""
 
-    BINDINGS = [Binding("tab", "accept_suggestion", "Complete", show=False)]
+    BINDINGS = [
+        Binding("tab", "accept_suggestion", "Complete", show=False),
+        Binding("up", "search_move(-1)", "Previous result", show=False),
+        Binding("down", "search_move(1)", "Next result", show=False),
+    ]
 
     def action_accept_suggestion(self) -> None:
         if self._suggestion:
             self.value = self._suggestion
             self.cursor_position = len(self.value)
+
+    def action_search_move(self, delta: int) -> None:
+        app = self.app
+        if isinstance(app, LayoutApp):
+            app.move_search_selection(delta)
+
+
+class SearchResultItem(ListItem):
+    def __init__(self, path: Path, label: str) -> None:
+        super().__init__(Label(label))
+        self.path = path
+
+
+class SearchResults(ListView):
+    """Live /search results shown in the bottom panel."""
+
+    def set_results(self, paths: list[Path], root: Path) -> None:
+        self.clear()
+        for path in paths:
+            try:
+                rel = str(path.relative_to(root))
+            except ValueError:
+                rel = str(path)
+            self.append(SearchResultItem(path, rel))
+        if paths:
+            self.index = 0
+
+    def move_selection(self, delta: int) -> None:
+        if delta > 0:
+            self.action_cursor_down()
+        else:
+            self.action_cursor_up()
+
+    @property
+    def selected_path(self) -> Path | None:
+        child = self.highlighted_child
+        return child.path if isinstance(child, SearchResultItem) else None
 
 
 class LayoutApp(App):
@@ -210,6 +260,12 @@ class LayoutApp(App):
         # What the command bar is currently being used for.
         self._input_mode = "command"
         self._create_target_dir: Path | None = None
+        # /search state: the index (loaded from disk if /index was run in
+        # an earlier session), and what the bottom panel showed before a
+        # live search took it over, so it can be restored afterwards.
+        self.search_index: dict | None = load_index(self.root_path)
+        self._searching = False
+        self._bottom_before_search: str | None = None
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "dismiss_overlay" and isinstance(self.focused, PtyTerminal):
@@ -236,6 +292,7 @@ class LayoutApp(App):
         with ContentSwitcher(initial="bottom-placeholder", id="bottom"):
             yield Static("Bottom Panel", id="bottom-placeholder")
             yield PtyTerminal(id="bottom-term")
+            yield SearchResults(id="bottom-search")
         yield CommandInput(
             id="command-bar",
             select_on_focus=False,
@@ -261,11 +318,9 @@ class LayoutApp(App):
         # swallows the keystroke as ordinary input instead of a binding.
         bar = self.query_one("#command-bar", Input)
         if bar.display:
-            bar.value = ""
-            bar.display = False
-            bar.placeholder = ""
-            self._input_mode = "command"
-        self.set_focus(None)
+            self._close_command_bar()
+        else:
+            self.set_focus(None)
 
     def action_detach_terminal(self) -> None:
         # F2 is intercepted by PtyTerminal itself (rather than forwarded to
@@ -318,8 +373,10 @@ class LayoutApp(App):
             self._refresh_tree_markers()
 
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self._open_file_in_workspace(event.path)
+
+    def _open_file_in_workspace(self, path: Path) -> None:
         workspace = self.query_one("#workspace", TextArea)
-        path = event.path
 
         if path in self.buffers:
             # Unsaved edits from earlier in this session - restore them
@@ -371,28 +428,74 @@ class LayoutApp(App):
             return
         raw = event.value
         mode = self._input_mode
-        bar = event.input
-        bar.display = False
-        bar.value = ""
-        bar.placeholder = ""
-        self._input_mode = "command"
-        self.set_focus(None)
+        was_searching = self._searching
+        selected_path = (
+            self.query_one("#bottom-search", SearchResults).selected_path
+            if was_searching
+            else None
+        )
+        self._close_command_bar()
+
+        if was_searching:
+            if selected_path is not None:
+                self._open_file_in_workspace(selected_path)
+            return
         if mode == "command":
             self.run_command(raw)
         else:
             self._create_entry(raw, is_dir=mode == "create_dir")
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "command-bar":
+        if event.input.id != "command-bar" or self._input_mode != "command":
             return
+        value = event.value
         # Backspacing the bar fully empty cancels it (but ignore the value
         # reset we do ourselves after a submit, which races with any focus
-        # change the executed command makes). Only applies in command mode -
-        # an empty name while naming a new file/folder is a normal state,
-        # not a signal to cancel.
-        if self._input_mode == "command" and event.value == "" and event.input.display:
-            event.input.display = False
-            self.set_focus(None)
+        # change the executed command makes).
+        if value == "" and event.input.display:
+            self._close_command_bar()
+            return
+        if value.startswith("/search "):
+            self._update_search(value[len("/search ") :])
+        elif self._searching:
+            self._exit_search_mode()
+
+    def _close_command_bar(self) -> None:
+        bar = self.query_one("#command-bar", Input)
+        bar.value = ""
+        bar.display = False
+        bar.placeholder = ""
+        self._input_mode = "command"
+        self._exit_search_mode()
+        self.set_focus(None)
+
+    def _enter_search_mode(self) -> None:
+        self._searching = True
+        bottom_switcher = self.query_one("#bottom", ContentSwitcher)
+        self._bottom_before_search = bottom_switcher.current
+        bottom_switcher.current = "bottom-search"
+
+    def _exit_search_mode(self) -> None:
+        if not self._searching:
+            return
+        self._searching = False
+        bottom_switcher = self.query_one("#bottom", ContentSwitcher)
+        bottom_switcher.current = self._bottom_before_search or "bottom-placeholder"
+        self._bottom_before_search = None
+
+    def _update_search(self, query: str) -> None:
+        if not self._searching:
+            self._enter_search_mode()
+        results_view = self.query_one("#bottom-search", SearchResults)
+        if self.search_index is None:
+            results_view.set_results([], self.root_path)
+            return
+        matches = search_index(self.search_index, query)
+        results_view.set_results([self.root_path / m for m in matches], self.root_path)
+
+    def move_search_selection(self, delta: int) -> None:
+        if self._searching:
+            self.query_one("#bottom-search", SearchResults).move_selection(delta)
 
     def begin_create_entry(self, directory: Path, is_dir: bool) -> None:
         self._create_target_dir = directory
@@ -535,6 +638,26 @@ class LayoutApp(App):
         self.query_one("#left-tree", FileTree).reload()
         self.notify(f"Deleted folder {path}", timeout=2)
 
+    def _cmd_index(self) -> None:
+        self.notify(f"Indexing {self.root_path}...", timeout=2)
+        self._build_index_worker(self.root_path)
+
+    @work(thread=True, exclusive=True)
+    def _build_index_worker(self, root: Path) -> None:
+        index = build_index(root)
+        try:
+            save_index(root, index)
+        except OSError as e:
+            self.call_from_thread(
+                self.notify, f"Could not write index file: {e}", severity="error"
+            )
+            return
+        if root == self.root_path:
+            self.search_index = index
+        self.call_from_thread(
+            self.notify, f"Indexed {len(index['files'])} files in {root}", timeout=3
+        )
+
     def run_command(self, raw: str) -> None:
         text = raw.strip()
         if text.startswith("/"):
@@ -556,6 +679,7 @@ class LayoutApp(App):
                     return
                 self.root_path = path
                 self.query_one("#left-tree", DirectoryTree).path = str(self.root_path)
+                self.search_index = load_index(self.root_path)
             left_switcher.current = "left-tree"
             self.query_one("#left-tree", DirectoryTree).focus()
         elif name == "left":
@@ -570,6 +694,10 @@ class LayoutApp(App):
             self._cmd_delete(arg)
         elif name == "delete_folder":
             self._cmd_delete_folder(arg)
+        elif name == "index":
+            self._cmd_index()
+        elif name == "search":
+            self.notify("Type a keyword after /search to see live results.", timeout=2)
         elif name == "help":
             self.notify("\n".join(f"/{cmd} - {desc}" for cmd, desc in COMMANDS.items()))
         else:
