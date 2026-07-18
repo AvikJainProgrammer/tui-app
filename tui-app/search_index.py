@@ -84,7 +84,7 @@ def load_index(root: Path) -> dict | None:
     return data
 
 
-def search_index(index: dict, query: str, limit: int = SEARCH_RESULT_LIMIT) -> list[str]:
+def query_index(index: dict, query: str, limit: int = SEARCH_RESULT_LIMIT) -> list[str]:
     """Relative paths matching every word in query (AND across words),
     prefix-matched against indexed tokens (OR within a word) so results
     update sensibly while the word is still being typed."""

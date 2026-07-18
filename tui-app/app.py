@@ -2,30 +2,29 @@ from __future__ import annotations
 
 import shutil
 import sys
+from enum import Enum
 from pathlib import Path
-
-from rich.text import Text
+from typing import Callable
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container
-from textual.suggester import Suggester
 from textual.widgets import (
     ContentSwitcher,
     DirectoryTree,
     Footer,
     Header,
     Input,
-    Label,
-    ListItem,
-    ListView,
     Static,
     TextArea,
 )
 
+from document import Document
+from files import FileKind, load_text_file
 from pty_terminal import PtyTerminal
-from search_index import build_index, load_index, save_index, search_index
+from search_index import build_index, load_index, query_index, save_index
+from widgets import CommandInput, DeletePathSuggester, FileTree, RightPanel, SearchResults
 
 # Files larger than this are shown read-only rather than loaded into the
 # editor, so a save can never silently truncate a file we didn't fully load.
@@ -70,157 +69,17 @@ COMMANDS = {
 }
 
 
-class RightPanel(Static):
-    """Right sidebar panel."""
-
-
 def _detect_language(path: Path) -> str | None:
     return EXTENSION_LANGUAGES.get(path.suffix.lower())
 
 
-class FileTree(DirectoryTree):
-    """DirectoryTree with new-file/new-folder shortcuts and unsaved markers."""
+class InputMode(Enum):
+    """What the command bar is currently being used for."""
 
-    BINDINGS = [
-        Binding("n", "new_file", "New File"),
-        Binding("N", "new_directory", "New Folder"),
-    ]
-
-    def __init__(self, path: str, dirty_paths: set[Path], **kwargs) -> None:
-        super().__init__(path, **kwargs)
-        self.dirty_paths = dirty_paths
-
-    def target_directory(self) -> Path:
-        """Where a new file/folder should be created: the selected folder,
-        the parent of the selected file, or the tree root if nothing is
-        selected."""
-        node = self.cursor_node
-        if node is None or node.data is None:
-            return Path(self.path)
-        path = node.data.path
-        return path if path.is_dir() else path.parent
-
-    def action_new_file(self) -> None:
-        self.app.begin_create_entry(self.target_directory(), is_dir=False)
-
-    def action_new_directory(self) -> None:
-        self.app.begin_create_entry(self.target_directory(), is_dir=True)
-
-    def render_label(self, node, base_style, style) -> Text:
-        label = super().render_label(node, base_style, style)
-        path = node.data.path if node.data else None
-        if path is not None and self._has_unsaved(path):
-            label = Text.assemble(label, (" ●", "bold yellow"))
-        return label
-
-    def _has_unsaved(self, path: Path) -> bool:
-        for dirty in self.dirty_paths:
-            if dirty == path or path in dirty.parents:
-                return True
-        return False
-
-
-class DeletePathSuggester(Suggester):
-    """Tab-completes the path argument of /delete and /delete_folder."""
-
-    def __init__(self, app: LayoutApp) -> None:
-        super().__init__(use_cache=False, case_sensitive=True)
-        self._layout_app = app
-
-    async def get_suggestion(self, value: str) -> str | None:
-        if value.startswith("/delete_folder "):
-            command, dirs_only = "/delete_folder ", True
-        elif value.startswith("/delete "):
-            command, dirs_only = "/delete ", False
-        else:
-            return None
-
-        partial = value[len(command) :]
-        if not partial or " " in partial:
-            # Nothing typed yet, or the path is finished and a flag (e.g.
-            # -f) is being typed - nothing sensible left to complete.
-            return None
-
-        dir_part, _, name_prefix = partial.rpartition("/")
-        if dir_part.startswith("~"):
-            base = Path(dir_part).expanduser()
-        elif dir_part.startswith("/"):
-            base = Path(dir_part)
-        else:
-            base = self._layout_app.root_path / dir_part
-
-        try:
-            entries = sorted(base.iterdir())
-        except OSError:
-            return None
-
-        for entry in entries:
-            # /delete_folder only ever wants a directory. /delete ultimately
-            # deletes a file, but folders still need to suggest so you can
-            # Tab into them on the way to one - only the trailing "/" (not
-            # the command) depends on what the matched entry actually is.
-            if dirs_only and not entry.is_dir():
-                continue
-            if entry.name.startswith(name_prefix):
-                completed = f"{dir_part}/{entry.name}" if dir_part else entry.name
-                if entry.is_dir():
-                    completed += "/"
-                return f"{command}{completed}"
-        return None
-
-
-class CommandInput(Input):
-    """Input that accepts a suggestion with Tab instead of the default
-    Right/End, and forwards Up/Down to the live /search results list
-    (Input itself doesn't use those keys for anything)."""
-
-    BINDINGS = [
-        Binding("tab", "accept_suggestion", "Complete", show=False),
-        Binding("up", "search_move(-1)", "Previous result", show=False),
-        Binding("down", "search_move(1)", "Next result", show=False),
-    ]
-
-    def action_accept_suggestion(self) -> None:
-        if self._suggestion:
-            self.value = self._suggestion
-            self.cursor_position = len(self.value)
-
-    def action_search_move(self, delta: int) -> None:
-        app = self.app
-        if isinstance(app, LayoutApp):
-            app.move_search_selection(delta)
-
-
-class SearchResultItem(ListItem):
-    def __init__(self, path: Path, label: str) -> None:
-        super().__init__(Label(label))
-        self.path = path
-
-
-class SearchResults(ListView):
-    """Live /search results shown in the bottom panel."""
-
-    def set_results(self, paths: list[Path], root: Path) -> None:
-        self.clear()
-        for path in paths:
-            try:
-                rel = str(path.relative_to(root))
-            except ValueError:
-                rel = str(path)
-            self.append(SearchResultItem(path, rel))
-        if paths:
-            self.index = 0
-
-    def move_selection(self, delta: int) -> None:
-        if delta > 0:
-            self.action_cursor_down()
-        else:
-            self.action_cursor_up()
-
-    @property
-    def selected_path(self) -> Path | None:
-        child = self.highlighted_child
-        return child.path if isinstance(child, SearchResultItem) else None
+    COMMAND = "command"
+    CREATE_FILE = "create_file"
+    CREATE_DIR = "create_dir"
+    SEARCH = "search"
 
 
 class LayoutApp(App):
@@ -246,26 +105,58 @@ class LayoutApp(App):
     def __init__(self, root_path: Path | None = None) -> None:
         super().__init__()
         self.root_path = root_path or Path.cwd()
-        self.open_file_path: Path | None = None
-        # In-memory content for files with unsaved edits, keyed by path, so
-        # switching away and back doesn't lose changes (only quitting does).
-        self.buffers: dict[Path, str] = {}
-        self.dirty_paths: set[Path] = set()
-        # Last known on-disk content per path, used to detect edits. A file
-        # is dirty exactly when its buffer differs from this. (Not a
-        # "currently loading" flag: load_text() posts its Changed message
-        # asynchronously, so a flag reset right after calling it would
-        # already be cleared by the time that message is actually handled.)
-        self._saved_reference: dict[Path, str] = {}
-        # What the command bar is currently being used for.
-        self._input_mode = "command"
+        self.document = Document()
+        self._input_mode = InputMode.COMMAND
         self._create_target_dir: Path | None = None
-        # /search state: the index (loaded from disk if /index was run in
-        # an earlier session), and what the bottom panel showed before a
-        # live search took it over, so it can be restored afterwards.
-        self.search_index: dict | None = load_index(self.root_path)
-        self._searching = False
+        # What the bottom panel showed before a live search took it over,
+        # so it can be restored once the search ends.
         self._bottom_before_search: str | None = None
+        # Loaded from disk if /index was run in an earlier session.
+        self.search_index: dict | None = load_index(self.root_path)
+
+        self._commands: dict[str, Callable[[str], None]] = {
+            "tree": self._cmd_tree,
+            "left": self._cmd_left,
+            "term": self._cmd_term,
+            "bottom": self._cmd_bottom,
+            "delete": self._cmd_delete,
+            "delete_folder": self._cmd_delete_folder,
+            "index": self._cmd_index,
+            "search": self._cmd_search,
+            "help": self._cmd_help,
+        }
+
+    # -- Frequently-used widgets, queried by ID everywhere else ------------
+
+    @property
+    def workspace(self) -> TextArea:
+        return self.query_one("#workspace", TextArea)
+
+    @property
+    def file_tree(self) -> FileTree:
+        return self.query_one("#left-tree", FileTree)
+
+    @property
+    def command_bar(self) -> CommandInput:
+        return self.query_one("#command-bar", CommandInput)
+
+    @property
+    def terminal(self) -> PtyTerminal:
+        return self.query_one("#bottom-term", PtyTerminal)
+
+    @property
+    def search_results(self) -> SearchResults:
+        return self.query_one("#bottom-search", SearchResults)
+
+    @property
+    def left_switcher(self) -> ContentSwitcher:
+        return self.query_one("#left", ContentSwitcher)
+
+    @property
+    def bottom_switcher(self) -> ContentSwitcher:
+        return self.query_one("#bottom", ContentSwitcher)
+
+    # -- App setup -----------------------------------------------------
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "dismiss_overlay" and isinstance(self.focused, PtyTerminal):
@@ -280,7 +171,7 @@ class LayoutApp(App):
         with Container(id="body"):
             with ContentSwitcher(initial="left-placeholder", id="left"):
                 yield Static("Left Panel", id="left-placeholder")
-                yield FileTree(str(self.root_path), self.dirty_paths, id="left-tree")
+                yield FileTree(str(self.root_path), self.document, id="left-tree")
             yield TextArea(
                 id="workspace",
                 theme="vscode_dark",
@@ -301,11 +192,13 @@ class LayoutApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#command-bar", Input).display = False
+        self.command_bar.display = False
         self.set_focus(None)
 
+    # -- Global key bindings ---------------------------------------------
+
     def action_open_command_bar(self) -> None:
-        bar = self.query_one("#command-bar", Input)
+        bar = self.command_bar
         bar.display = True
         bar.value = "/"
         bar.cursor_position = len(bar.value)
@@ -316,8 +209,7 @@ class LayoutApp(App):
         # just the command bar - that's what lets "/" work again afterwards
         # without reaching for the mouse, since a focused widget otherwise
         # swallows the keystroke as ordinary input instead of a binding.
-        bar = self.query_one("#command-bar", Input)
-        if bar.display:
+        if self.command_bar.display:
             self._close_command_bar()
         else:
             self.set_focus(None)
@@ -330,113 +222,96 @@ class LayoutApp(App):
             self.set_focus(None)
 
     def action_save_file(self) -> None:
-        if self.open_file_path is None:
+        path = self.document.open_path
+        if path is None or self.workspace.read_only:
             return
-        workspace = self.query_one("#workspace", TextArea)
-        if workspace.read_only:
-            return
+        text = self.workspace.text
         try:
-            self.open_file_path.write_text(workspace.text)
+            path.write_text(text)
         except OSError as e:
-            self.notify(f"Could not save {self.open_file_path}:\n{e}", severity="error")
+            self.notify(f"Could not save {path}:\n{e}", severity="error")
             return
-        self._saved_reference[self.open_file_path] = workspace.text
-        self.buffers.pop(self.open_file_path, None)
-        self.dirty_paths.discard(self.open_file_path)
+        self.document.mark_saved(path, text)
         self._refresh_tree_markers()
-        self.notify(f"Saved {self.open_file_path}", timeout=2)
+        self.notify(f"Saved {path}", timeout=2)
 
     def _refresh_tree_markers(self) -> None:
         # Tree caches rendered lines internally, so a plain refresh() would
         # just repaint that cache unchanged - render_label() (where the
         # unsaved-change marker is added) only gets re-run for a node once
         # its cache entry is invalidated, which is what this actually does.
-        self.query_one("#left-tree", FileTree)._invalidate()
+        self.file_tree._invalidate()
+
+    # -- Editor / file-open plumbing --------------------------------------
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        path = self.open_file_path
+        path = self.document.open_path
         if path is None or event.text_area.read_only:
             return
-        text = event.text_area.text
-        if text == self._saved_reference.get(path, ""):
-            # Matches the on-disk content - either the load itself (its
-            # Changed message lands here too) or the user edited back to
-            # exactly the saved state.
-            if path in self.dirty_paths:
-                self.dirty_paths.discard(path)
-                self.buffers.pop(path, None)
-                self._refresh_tree_markers()
-            return
-        self.buffers[path] = text
-        if path not in self.dirty_paths:
-            self.dirty_paths.add(path)
+        if self.document.record_change(path, event.text_area.text):
             self._refresh_tree_markers()
 
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         self._open_file_in_workspace(event.path)
 
     def _open_file_in_workspace(self, path: Path) -> None:
-        workspace = self.query_one("#workspace", TextArea)
+        workspace = self.workspace
 
-        if path in self.buffers:
+        buffered = self.document.buffered_text(path)
+        if buffered is not None:
             # Unsaved edits from earlier in this session - restore them
             # rather than re-reading the (older) content on disk.
             workspace.read_only = False
             workspace.language = _detect_language(path)
-            workspace.load_text(self.buffers[path])
-            self.open_file_path = path
+            workspace.load_text(buffered)
+            self.document.open(path)
             return
 
-        try:
-            data = path.read_bytes()
-        except OSError as e:
+        loaded = load_text_file(path, MAX_EDIT_BYTES)
+
+        if loaded.kind is FileKind.UNREADABLE:
             workspace.read_only = True
             workspace.language = None
-            workspace.load_text(f"Could not read {path}:\n{e}")
-            self.open_file_path = None
+            workspace.load_text(f"Could not read {path}:\n{loaded.error}")
+            self.document.close_open()
             return
 
-        if b"\x00" in data[:8000]:
+        if loaded.kind is FileKind.BINARY:
             workspace.read_only = True
             workspace.language = None
             workspace.load_text(f"{path}\n\n(binary file, not shown)")
-            self.open_file_path = None
+            self.document.close_open()
             return
 
-        if len(data) > MAX_EDIT_BYTES:
-            text = data[:MAX_EDIT_BYTES].decode("utf-8", errors="replace")
-            text += f"\n\n... truncated ({len(data):,} bytes total, too large to edit)"
+        if loaded.kind is FileKind.TOO_LARGE:
+            text = loaded.text + f"\n\n... truncated ({loaded.size:,} bytes total, too large to edit)"
             workspace.read_only = True
             workspace.language = _detect_language(path)
             workspace.load_text(text)
-            self.open_file_path = None
+            self.document.close_open()
             self.notify(
-                f"{path.name} is too large to edit ({len(data):,} bytes) - showing read-only preview.",
+                f"{path.name} is too large to edit ({loaded.size:,} bytes) - showing read-only preview.",
                 severity="warning",
             )
             return
 
-        text = data.decode("utf-8", errors="replace")
         workspace.read_only = False
         workspace.language = _detect_language(path)
-        self._saved_reference[path] = text
-        workspace.load_text(text)
-        self.open_file_path = path
+        self.document.remember_saved(path, loaded.text)
+        workspace.load_text(loaded.text)
+        self.document.open(path)
+
+    # -- Command bar: submit / live-typing routing ------------------------
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "command-bar":
             return
         raw = event.value
         mode = self._input_mode
-        was_searching = self._searching
-        selected_path = (
-            self.query_one("#bottom-search", SearchResults).selected_path
-            if was_searching
-            else None
-        )
+        selected_path = self.search_results.selected_path if mode is InputMode.SEARCH else None
         self._close_command_bar()
 
-        if was_searching:
+        if mode is InputMode.SEARCH:
             if selected_path is not None:
                 self._open_file_in_workspace(selected_path)
                 # Unlike tree selection (which leaves the tree focused so
@@ -444,15 +319,18 @@ class LayoutApp(App):
                 # one-shot action - focus the editor immediately so
                 # scrolling (arrows, PageUp/Down) works without an extra
                 # step, whether or not the file ends up editable.
-                self.query_one("#workspace", TextArea).focus()
+                self.workspace.focus()
             return
-        if mode == "command":
+        if mode is InputMode.COMMAND:
             self.run_command(raw)
         else:
-            self._create_entry(raw, is_dir=mode == "create_dir")
+            self._create_entry(raw, is_dir=mode is InputMode.CREATE_DIR)
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "command-bar" or self._input_mode != "command":
+        if event.input.id != "command-bar" or self._input_mode not in (
+            InputMode.COMMAND,
+            InputMode.SEARCH,
+        ):
             return
         value = event.value
         # Backspacing the bar fully empty cancels it (but ignore the value
@@ -463,50 +341,53 @@ class LayoutApp(App):
             return
         if value.startswith("/search "):
             self._update_search(value[len("/search ") :])
-        elif self._searching:
+        elif self._input_mode is InputMode.SEARCH:
             self._exit_search_mode()
 
     def _close_command_bar(self) -> None:
-        bar = self.query_one("#command-bar", Input)
+        bar = self.command_bar
         bar.value = ""
         bar.display = False
         bar.placeholder = ""
-        self._input_mode = "command"
+        # Must run before resetting _input_mode below: _exit_search_mode()
+        # only restores the bottom panel if mode is still SEARCH.
         self._exit_search_mode()
+        self._input_mode = InputMode.COMMAND
         self.set_focus(None)
 
+    # -- Live /search -----------------------------------------------------
+
     def _enter_search_mode(self) -> None:
-        self._searching = True
-        bottom_switcher = self.query_one("#bottom", ContentSwitcher)
-        self._bottom_before_search = bottom_switcher.current
-        bottom_switcher.current = "bottom-search"
+        self._input_mode = InputMode.SEARCH
+        self._bottom_before_search = self.bottom_switcher.current
+        self.bottom_switcher.current = "bottom-search"
 
     def _exit_search_mode(self) -> None:
-        if not self._searching:
+        if self._input_mode is not InputMode.SEARCH:
             return
-        self._searching = False
-        bottom_switcher = self.query_one("#bottom", ContentSwitcher)
-        bottom_switcher.current = self._bottom_before_search or "bottom-placeholder"
+        self._input_mode = InputMode.COMMAND
+        self.bottom_switcher.current = self._bottom_before_search or "bottom-placeholder"
         self._bottom_before_search = None
 
     def _update_search(self, query: str) -> None:
-        if not self._searching:
+        if self._input_mode is not InputMode.SEARCH:
             self._enter_search_mode()
-        results_view = self.query_one("#bottom-search", SearchResults)
         if self.search_index is None:
-            results_view.set_results([], self.root_path)
+            self.search_results.set_results([], self.root_path)
             return
-        matches = search_index(self.search_index, query)
-        results_view.set_results([self.root_path / m for m in matches], self.root_path)
+        matches = query_index(self.search_index, query)
+        self.search_results.set_results([self.root_path / m for m in matches], self.root_path)
 
     def move_search_selection(self, delta: int) -> None:
-        if self._searching:
-            self.query_one("#bottom-search", SearchResults).move_selection(delta)
+        if self._input_mode is InputMode.SEARCH:
+            self.search_results.move_selection(delta)
+
+    # -- New file/folder (n / N in the tree) -------------------------------
 
     def begin_create_entry(self, directory: Path, is_dir: bool) -> None:
         self._create_target_dir = directory
-        self._input_mode = "create_dir" if is_dir else "create_file"
-        bar = self.query_one("#command-bar", Input)
+        self._input_mode = InputMode.CREATE_DIR if is_dir else InputMode.CREATE_FILE
+        bar = self.command_bar
         kind = "folder" if is_dir else "file"
         bar.placeholder = f"New {kind} name in {directory}/"
         bar.value = ""
@@ -529,17 +410,19 @@ class LayoutApp(App):
             self.notify(f"Could not create {kind} {target}:\n{e}", severity="error")
             return
 
-        self.query_one("#left-tree", FileTree).reload()
+        self.file_tree.reload()
         self.notify(f"Created {kind} {target}", timeout=2)
 
         if not is_dir:
-            workspace = self.query_one("#workspace", TextArea)
+            workspace = self.workspace
             workspace.read_only = False
             workspace.language = _detect_language(target)
-            self._saved_reference[target] = ""
+            self.document.remember_saved(target, "")
             workspace.load_text("")
-            self.open_file_path = target
+            self.document.open(target)
             workspace.focus()
+
+    # -- /delete and /delete_folder ----------------------------------------
 
     def _resolve_within_root(self, path_str: str) -> Path | None:
         """Resolve a /delete[_folder] path argument, kept scoped inside the
@@ -559,26 +442,13 @@ class LayoutApp(App):
             return None
         return resolved
 
-    def _forget_path(self, path: Path, recursive: bool = False) -> None:
-        """Drop any buffered/dirty state for a path (or, if recursive,
-        anything under it) that no longer exists after a delete."""
-
-        def matches(candidate: Path) -> bool:
-            return candidate == path or (recursive and path in candidate.parents)
-
-        for stale in [p for p in self.buffers if matches(p)]:
-            self.buffers.pop(stale, None)
-        for stale in [p for p in self.dirty_paths if matches(p)]:
-            self.dirty_paths.discard(stale)
-        for stale in [p for p in self._saved_reference if matches(p)]:
-            self._saved_reference.pop(stale, None)
-
-        if self.open_file_path is not None and matches(self.open_file_path):
-            self.open_file_path = None
-            workspace = self.query_one("#workspace", TextArea)
-            workspace.read_only = True
-            workspace.language = None
-            workspace.load_text(f"{path} was deleted.")
+    def _forget_deleted(self, path: Path, recursive: bool = False) -> None:
+        if not self.document.forget(path, recursive=recursive):
+            return
+        workspace = self.workspace
+        workspace.read_only = True
+        workspace.language = None
+        workspace.load_text(f"{path} was deleted.")
 
     def _cmd_delete(self, arg: str) -> None:
         path = self._resolve_within_root(arg)
@@ -596,8 +466,8 @@ class LayoutApp(App):
         except OSError as e:
             self.notify(f"Could not delete {path}:\n{e}", severity="error")
             return
-        self._forget_path(path)
-        self.query_one("#left-tree", FileTree).reload()
+        self._forget_deleted(path)
+        self.file_tree.reload()
         self.notify(f"Deleted {path}", timeout=2)
 
     def _cmd_delete_folder(self, arg: str) -> None:
@@ -640,11 +510,13 @@ class LayoutApp(App):
         except OSError as e:
             self.notify(f"Could not delete {path}:\n{e}", severity="error")
             return
-        self._forget_path(path, recursive=True)
-        self.query_one("#left-tree", FileTree).reload()
+        self._forget_deleted(path, recursive=True)
+        self.file_tree.reload()
         self.notify(f"Deleted folder {path}", timeout=2)
 
-    def _cmd_index(self) -> None:
+    # -- /index -------------------------------------------------------------
+
+    def _cmd_index(self, arg: str) -> None:
         self.notify(f"Indexing {self.root_path}...", timeout=2)
         self._build_index_worker(self.root_path)
 
@@ -664,6 +536,37 @@ class LayoutApp(App):
             self.notify, f"Indexed {len(index['files'])} files in {root}", timeout=3
         )
 
+    # -- Remaining slash commands -------------------------------------------
+
+    def _cmd_tree(self, arg: str) -> None:
+        if arg:
+            path = Path(arg).expanduser()
+            if not path.is_dir():
+                self.notify(f"Not a directory: {path}", severity="error")
+                return
+            self.root_path = path
+            self.file_tree.path = str(self.root_path)
+            self.search_index = load_index(self.root_path)
+        self.left_switcher.current = "left-tree"
+        self.file_tree.focus()
+
+    def _cmd_left(self, arg: str) -> None:
+        self.left_switcher.current = "left-placeholder"
+
+    def _cmd_term(self, arg: str) -> None:
+        self.bottom_switcher.current = "bottom-term"
+        self.terminal.focus()
+        self.notify("Terminal focused. Press F2 to leave it.", timeout=3)
+
+    def _cmd_bottom(self, arg: str) -> None:
+        self.bottom_switcher.current = "bottom-placeholder"
+
+    def _cmd_search(self, arg: str) -> None:
+        self.notify("Type a keyword after /search to see live results.", timeout=2)
+
+    def _cmd_help(self, arg: str) -> None:
+        self.notify("\n".join(f"/{cmd} - {desc}" for cmd, desc in COMMANDS.items()))
+
     def run_command(self, raw: str) -> None:
         text = raw.strip()
         if text.startswith("/"):
@@ -671,43 +574,12 @@ class LayoutApp(App):
         if not text:
             return
 
-        parts = text.split(maxsplit=1)
-        name = parts[0].lower()
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        left_switcher = self.query_one("#left", ContentSwitcher)
-        bottom_switcher = self.query_one("#bottom", ContentSwitcher)
-
-        if name == "tree":
-            if arg:
-                path = Path(arg).expanduser()
-                if not path.is_dir():
-                    self.notify(f"Not a directory: {path}", severity="error")
-                    return
-                self.root_path = path
-                self.query_one("#left-tree", DirectoryTree).path = str(self.root_path)
-                self.search_index = load_index(self.root_path)
-            left_switcher.current = "left-tree"
-            self.query_one("#left-tree", DirectoryTree).focus()
-        elif name == "left":
-            left_switcher.current = "left-placeholder"
-        elif name == "term":
-            bottom_switcher.current = "bottom-term"
-            self.query_one("#bottom-term", PtyTerminal).focus()
-            self.notify("Terminal focused. Press F2 to leave it.", timeout=3)
-        elif name == "bottom":
-            bottom_switcher.current = "bottom-placeholder"
-        elif name == "delete":
-            self._cmd_delete(arg)
-        elif name == "delete_folder":
-            self._cmd_delete_folder(arg)
-        elif name == "index":
-            self._cmd_index()
-        elif name == "search":
-            self.notify("Type a keyword after /search to see live results.", timeout=2)
-        elif name == "help":
-            self.notify("\n".join(f"/{cmd} - {desc}" for cmd, desc in COMMANDS.items()))
-        else:
+        name, _, arg = text.partition(" ")
+        handler = self._commands.get(name.lower())
+        if handler is None:
             self.notify(f"Unknown command: /{name}  (try /help)", severity="error")
+            return
+        handler(arg.strip())
 
 
 if __name__ == "__main__":
