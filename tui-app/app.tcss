@@ -1,0 +1,39 @@
+Screen {
+    layout: vertical;
+}
+
+#body {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#left {
+    width: 22%;
+    height: 100%;
+    border: round $primary;
+    padding: 1 2;
+    content-align: center top;
+}
+
+#workspace {
+    width: 1fr;
+    height: 100%;
+    border: round $accent;
+    padding: 1 2;
+    content-align: center middle;
+}
+
+#right {
+    width: 22%;
+    height: 100%;
+    border: round $primary;
+    padding: 1 2;
+    content-align: center top;
+}
+
+#bottom {
+    height: 22%;
+    border: round $secondary;
+    padding: 1 2;
+    content-align: center middle;
+}
