@@ -12,14 +12,43 @@ from textual.widgets import (
     Header,
     Input,
     Static,
+    TextArea,
 )
 
 from pty_terminal import PtyTerminal
 
-MAX_PREVIEW_BYTES = 200_000
+# Files larger than this are shown read-only rather than loaded into the
+# editor, so a save can never silently truncate a file we didn't fully load.
+MAX_EDIT_BYTES = 2_000_000
+
+# Textual's TextArea only ships tree-sitter grammars for these languages.
+EXTENSION_LANGUAGES = {
+    ".py": "python",
+    ".pyw": "python",
+    ".js": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    ".jsx": "javascript",
+    ".json": "json",
+    ".html": "html",
+    ".htm": "html",
+    ".css": "css",
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".sql": "sql",
+    ".toml": "toml",
+    ".xml": "xml",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+}
 
 COMMANDS = {
-    "tree": "Browse files in the left panel (optionally: /tree <path>); select a file to open it in the workspace",
+    "tree": "Browse files in the left panel (optionally: /tree <path>); select a file to edit it in the workspace (Ctrl+S to save)",
     "left": "Reset the left panel to its placeholder",
     "term": "Show an interactive terminal in the bottom panel (F2 to leave it)",
     "bottom": "Reset the bottom panel to its placeholder",
@@ -31,24 +60,8 @@ class RightPanel(Static):
     """Right sidebar panel."""
 
 
-class Workspace(Static):
-    """Central workspace panel."""
-
-
-def _load_file_preview(path: Path) -> str:
-    try:
-        data = path.read_bytes()
-    except OSError as e:
-        return f"Could not read {path}:\n{e}"
-
-    if b"\x00" in data[:8000]:
-        return f"{path}\n\n(binary file, not shown)"
-
-    truncated = len(data) > MAX_PREVIEW_BYTES
-    text = data[:MAX_PREVIEW_BYTES].decode("utf-8", errors="replace")
-    if truncated:
-        text += f"\n\n... truncated ({len(data):,} bytes total)"
-    return f"{path}\n\n{text}"
+def _detect_language(path: Path) -> str | None:
+    return EXTENSION_LANGUAGES.get(path.suffix.lower())
 
 
 class LayoutApp(App):
@@ -58,11 +71,13 @@ class LayoutApp(App):
         ("slash", "open_command_bar", "Command"),
         ("escape", "dismiss_overlay", "Cancel"),
         ("f2", "detach_terminal", "Leave Terminal"),
+        ("ctrl+s", "save_file", "Save"),
     ]
 
     def __init__(self, root_path: Path | None = None) -> None:
         super().__init__()
         self.root_path = root_path or Path.cwd()
+        self.open_file_path: Path | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -70,7 +85,12 @@ class LayoutApp(App):
             with ContentSwitcher(initial="left-placeholder", id="left"):
                 yield Static("Left Panel", id="left-placeholder")
                 yield DirectoryTree(str(self.root_path), id="left-tree")
-            yield Workspace("Central Workspace", id="workspace")
+            yield TextArea(
+                id="workspace",
+                theme="vscode_dark",
+                show_line_numbers=True,
+                placeholder="Use /tree to browse files, then select one to open it here.",
+            )
             yield RightPanel("Right Panel", id="right")
         with ContentSwitcher(initial="bottom-placeholder", id="bottom"):
             yield Static("Bottom Panel", id="bottom-placeholder")
@@ -103,9 +123,56 @@ class LayoutApp(App):
         if isinstance(self.focused, PtyTerminal):
             self.set_focus(None)
 
+    def action_save_file(self) -> None:
+        if self.open_file_path is None:
+            return
+        workspace = self.query_one("#workspace", TextArea)
+        if workspace.read_only:
+            return
+        try:
+            self.open_file_path.write_text(workspace.text)
+        except OSError as e:
+            self.notify(f"Could not save {self.open_file_path}:\n{e}", severity="error")
+            return
+        self.notify(f"Saved {self.open_file_path}", timeout=2)
+
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
-        workspace = self.query_one("#workspace", Workspace)
-        workspace.update(_load_file_preview(event.path))
+        workspace = self.query_one("#workspace", TextArea)
+        path = event.path
+
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            workspace.read_only = True
+            workspace.language = None
+            workspace.load_text(f"Could not read {path}:\n{e}")
+            self.open_file_path = None
+            return
+
+        if b"\x00" in data[:8000]:
+            workspace.read_only = True
+            workspace.language = None
+            workspace.load_text(f"{path}\n\n(binary file, not shown)")
+            self.open_file_path = None
+            return
+
+        if len(data) > MAX_EDIT_BYTES:
+            text = data[:MAX_EDIT_BYTES].decode("utf-8", errors="replace")
+            text += f"\n\n... truncated ({len(data):,} bytes total, too large to edit)"
+            workspace.read_only = True
+            workspace.language = _detect_language(path)
+            workspace.load_text(text)
+            self.open_file_path = None
+            self.notify(
+                f"{path.name} is too large to edit ({len(data):,} bytes) - showing read-only preview.",
+                severity="warning",
+            )
+            return
+
+        workspace.read_only = False
+        workspace.language = _detect_language(path)
+        workspace.load_text(data.decode("utf-8", errors="replace"))
+        self.open_file_path = path
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "command-bar":

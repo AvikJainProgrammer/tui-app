@@ -29,8 +29,6 @@ Screen {
     width: 1fr;
     height: 100%;
     border: round $accent;
-    padding: 1 2;
-    overflow-y: auto;
 }
 
 #right {
