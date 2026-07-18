@@ -108,7 +108,6 @@ class PtyTerminal(Widget, can_focus=True):
         self._fd: int | None = None
         self._screen: pyte.Screen | None = None
         self._stream: pyte.Stream | None = None
-        self._last_escape: float | None = None
 
     def on_mount(self) -> None:
         cols = max(self.size.width, 1) or 80
@@ -163,7 +162,14 @@ class PtyTerminal(Widget, can_focus=True):
         if not data:
             self._stop_shell()
             return
-        self._stream.feed(data.decode(errors="replace"))
+        try:
+            self._stream.feed(data.decode(errors="replace"))
+        except Exception:
+            # pyte can raise on escape sequences it doesn't fully support
+            # (e.g. some private CSI...m forms vim emits); it resets its own
+            # parser state before re-raising, so just drop this chunk rather
+            # than let the exception kill screen updates from here on.
+            pass
         self.refresh()
 
     def _stop_shell(self) -> None:
@@ -186,16 +192,11 @@ class PtyTerminal(Widget, can_focus=True):
         if self._fd is None:
             return
 
-        if event.key == "escape":
-            now = asyncio.get_event_loop().time()
-            if self._last_escape is not None and now - self._last_escape < 0.5:
-                # Double-escape detaches focus instead of being sent to the
-                # shell, so a single Escape still works normally (e.g. vim).
-                self._last_escape = None
-                return
-            self._last_escape = now
-        else:
-            self._last_escape = None
+        if event.key == "f2":
+            # Dedicated detach key: Escape is fully reserved for the shell
+            # (vim needs a real, single, un-trapped Escape), so detaching
+            # can't reuse it or any other key a shell program might expect.
+            return
 
         event.stop()
         event.prevent_default()

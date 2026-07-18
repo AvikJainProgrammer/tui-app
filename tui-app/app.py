@@ -19,7 +19,7 @@ from pty_terminal import PtyTerminal
 COMMANDS = {
     "tree": "Show a file tree in the left panel (optionally: /tree <path>)",
     "left": "Reset the left panel to its placeholder",
-    "term": "Show an interactive terminal in the bottom panel (Escape twice to leave it)",
+    "term": "Show an interactive terminal in the bottom panel (F2 to leave it)",
     "bottom": "Reset the bottom panel to its placeholder",
     "help": "List available commands",
 }
@@ -39,6 +39,7 @@ class LayoutApp(App):
         ("q", "quit", "Quit"),
         ("slash", "open_command_bar", "Command"),
         ("escape", "dismiss_overlay", "Cancel"),
+        ("f2", "detach_terminal", "Leave Terminal"),
     ]
 
     def __init__(self, root_path: Path | None = None) -> None:
@@ -76,9 +77,12 @@ class LayoutApp(App):
             bar.value = ""
             bar.display = False
             self.set_focus(None)
-        elif isinstance(self.focused, PtyTerminal):
-            # Reached only via double-Escape inside the terminal (a single
-            # Escape there is forwarded to the shell instead, e.g. for vim).
+
+    def action_detach_terminal(self) -> None:
+        # F2 is intercepted by PtyTerminal itself (rather than forwarded to
+        # the shell) specifically so it can bubble here and blur it; Escape
+        # is deliberately left alone since shell programs like vim need it.
+        if isinstance(self.focused, PtyTerminal):
             self.set_focus(None)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -128,6 +132,7 @@ class LayoutApp(App):
         elif name == "term":
             bottom_switcher.current = "bottom-term"
             self.query_one("#bottom-term", PtyTerminal).focus()
+            self.notify("Terminal focused. Press F2 to leave it.", timeout=3)
         elif name == "bottom":
             bottom_switcher.current = "bottom-placeholder"
         elif name == "help":
