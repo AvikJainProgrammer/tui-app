@@ -89,6 +89,7 @@ class LayoutApp(App):
                 id="workspace",
                 theme="vscode_dark",
                 show_line_numbers=True,
+                tab_behavior="indent",
                 placeholder="Use /tree to browse files, then select one to open it here.",
             )
             yield RightPanel("Right Panel", id="right")
