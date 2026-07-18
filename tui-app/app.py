@@ -220,8 +220,15 @@ class LayoutApp(App):
         self._saved_reference[self.open_file_path] = workspace.text
         self.buffers.pop(self.open_file_path, None)
         self.dirty_paths.discard(self.open_file_path)
-        self.query_one("#left-tree", FileTree).refresh()
+        self._refresh_tree_markers()
         self.notify(f"Saved {self.open_file_path}", timeout=2)
+
+    def _refresh_tree_markers(self) -> None:
+        # Tree caches rendered lines internally, so a plain refresh() would
+        # just repaint that cache unchanged - render_label() (where the
+        # unsaved-change marker is added) only gets re-run for a node once
+        # its cache entry is invalidated, which is what this actually does.
+        self.query_one("#left-tree", FileTree)._invalidate()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         path = self.open_file_path
@@ -235,12 +242,12 @@ class LayoutApp(App):
             if path in self.dirty_paths:
                 self.dirty_paths.discard(path)
                 self.buffers.pop(path, None)
-                self.query_one("#left-tree", FileTree).refresh()
+                self._refresh_tree_markers()
             return
         self.buffers[path] = text
         if path not in self.dirty_paths:
             self.dirty_paths.add(path)
-            self.query_one("#left-tree", FileTree).refresh()
+            self._refresh_tree_markers()
 
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         workspace = self.query_one("#workspace", TextArea)
