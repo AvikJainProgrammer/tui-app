@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container
 from textual.widgets import (
     ContentSwitcher,
@@ -66,10 +67,20 @@ def _detect_language(path: Path) -> str | None:
 
 class LayoutApp(App):
     CSS_PATH = "app.tcss"
+    # Nothing should grab focus just because it's the first focusable widget
+    # in the DOM - without this, Textual's default auto-focus means typing
+    # (or even just resizing the terminal) can silently dump keystrokes into
+    # the editor with no widget deliberately focused by the user.
+    AUTO_FOCUS = None
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("slash", "open_command_bar", "Command"),
-        ("escape", "dismiss_overlay", "Cancel"),
+        # priority=True: TextArea's own tab_behavior="indent" mode hijacks a
+        # plain Escape to mean "focus_next" and consumes it before it would
+        # ever bubble up to a normal binding, so this must be checked before
+        # the key reaches the focused widget at all. check_action() below
+        # still lets it fall through untouched to the terminal, for vim.
+        Binding("escape", "dismiss_overlay", "Cancel", priority=True),
         ("f2", "detach_terminal", "Leave Terminal"),
         ("ctrl+s", "save_file", "Save"),
     ]
@@ -78,6 +89,14 @@ class LayoutApp(App):
         super().__init__()
         self.root_path = root_path or Path.cwd()
         self.open_file_path: Path | None = None
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "dismiss_overlay" and isinstance(self.focused, PtyTerminal):
+            # Let the priority Escape binding fall through to the terminal
+            # untouched instead of dismissing anything, since vim (etc.)
+            # needs a real, single Escape.
+            return False
+        return True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -111,11 +130,15 @@ class LayoutApp(App):
         bar.focus()
 
     def action_dismiss_overlay(self) -> None:
+        # Escape always blurs whatever is focused (editor, tree, ...), not
+        # just the command bar - that's what lets "/" work again afterwards
+        # without reaching for the mouse, since a focused widget otherwise
+        # swallows the keystroke as ordinary input instead of a binding.
         bar = self.query_one("#command-bar", Input)
         if bar.display:
             bar.value = ""
             bar.display = False
-            self.set_focus(None)
+        self.set_focus(None)
 
     def action_detach_terminal(self) -> None:
         # F2 is intercepted by PtyTerminal itself (rather than forwarded to
