@@ -122,9 +122,9 @@ class DeletePathSuggester(Suggester):
 
     async def get_suggestion(self, value: str) -> str | None:
         if value.startswith("/delete_folder "):
-            command, want_dir = "/delete_folder ", True
+            command, dirs_only = "/delete_folder ", True
         elif value.startswith("/delete "):
-            command, want_dir = "/delete ", False
+            command, dirs_only = "/delete ", False
         else:
             return None
 
@@ -148,11 +148,15 @@ class DeletePathSuggester(Suggester):
             return None
 
         for entry in entries:
-            if entry.is_dir() != want_dir:
+            # /delete_folder only ever wants a directory. /delete ultimately
+            # deletes a file, but folders still need to suggest so you can
+            # Tab into them on the way to one - only the trailing "/" (not
+            # the command) depends on what the matched entry actually is.
+            if dirs_only and not entry.is_dir():
                 continue
             if entry.name.startswith(name_prefix):
                 completed = f"{dir_part}/{entry.name}" if dir_part else entry.name
-                if want_dir:
+                if entry.is_dir():
                     completed += "/"
                 return f"{command}{completed}"
         return None
