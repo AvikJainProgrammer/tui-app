@@ -1,2 +1,6 @@
-textual==8.2.8
+# Requires Python 3.10+: the [syntax] extra (tree-sitter grammars used for
+# TextArea syntax highlighting) is only published for 3.10+, and silently
+# resolves to nothing on older Python - the app still runs, but with no
+# syntax highlighting.
+textual[syntax]==8.2.8
 pyte==0.8.2
