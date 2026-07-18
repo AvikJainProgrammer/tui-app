@@ -16,8 +16,10 @@ from textual.widgets import (
 
 from pty_terminal import PtyTerminal
 
+MAX_PREVIEW_BYTES = 200_000
+
 COMMANDS = {
-    "tree": "Show a file tree in the left panel (optionally: /tree <path>)",
+    "tree": "Browse files in the left panel (optionally: /tree <path>); select a file to open it in the workspace",
     "left": "Reset the left panel to its placeholder",
     "term": "Show an interactive terminal in the bottom panel (F2 to leave it)",
     "bottom": "Reset the bottom panel to its placeholder",
@@ -31,6 +33,22 @@ class RightPanel(Static):
 
 class Workspace(Static):
     """Central workspace panel."""
+
+
+def _load_file_preview(path: Path) -> str:
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return f"Could not read {path}:\n{e}"
+
+    if b"\x00" in data[:8000]:
+        return f"{path}\n\n(binary file, not shown)"
+
+    truncated = len(data) > MAX_PREVIEW_BYTES
+    text = data[:MAX_PREVIEW_BYTES].decode("utf-8", errors="replace")
+    if truncated:
+        text += f"\n\n... truncated ({len(data):,} bytes total)"
+    return f"{path}\n\n{text}"
 
 
 class LayoutApp(App):
@@ -85,6 +103,10 @@ class LayoutApp(App):
         if isinstance(self.focused, PtyTerminal):
             self.set_focus(None)
 
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        workspace = self.query_one("#workspace", Workspace)
+        workspace.update(_load_file_preview(event.path))
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "command-bar":
             return
@@ -127,6 +149,7 @@ class LayoutApp(App):
                 self.root_path = path
                 self.query_one("#left-tree", DirectoryTree).path = str(self.root_path)
             left_switcher.current = "left-tree"
+            self.query_one("#left-tree", DirectoryTree).focus()
         elif name == "left":
             left_switcher.current = "left-placeholder"
         elif name == "term":

@@ -30,7 +30,7 @@ Screen {
     height: 100%;
     border: round $accent;
     padding: 1 2;
-    content-align: center middle;
+    overflow-y: auto;
 }
 
 #right {
