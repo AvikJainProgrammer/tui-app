@@ -439,6 +439,12 @@ class LayoutApp(App):
         if was_searching:
             if selected_path is not None:
                 self._open_file_in_workspace(selected_path)
+                # Unlike tree selection (which leaves the tree focused so
+                # you can keep browsing), picking a search result is a
+                # one-shot action - focus the editor immediately so
+                # scrolling (arrows, PageUp/Down) works without an extra
+                # step, whether or not the file ends up editable.
+                self.query_one("#workspace", TextArea).focus()
             return
         if mode == "command":
             self.run_command(raw)
